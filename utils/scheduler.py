@@ -1,56 +1,58 @@
 """
-Модуль планировщика задач мониторинга.
-
-Использует APScheduler для организации периодического запуска
-мониторов с поддержкой динамического изменения интервалов
-(нормальный режим / усиленный при обнаружении билетов).
+Планировщик задач для мониторинга
+Управление запуском и остановкой мониторов
 """
 
+import asyncio
+from typing import List
+from monitors import (
+    ShalomSiteMonitor,
+    AfishaMonitor,
+    MosbiletMonitor,
+    TelegramChannelMonitor,
+    VKGroupMonitor
+)
 import logging
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 
 logger = logging.getLogger(__name__)
 
 
 class MonitorScheduler:
-    """Обёртка над APScheduler для управления задачами мониторинга."""
+    """Планировщик мониторов"""
 
-    def __init__(self) -> None:
-        self._scheduler = AsyncIOScheduler()
+    def __init__(self):
+        self.monitors = []
+        self.tasks = []
 
-    def add_monitor(self, monitor_id: str, func: object, interval_seconds: int) -> None:
-        """
-        Добавляет задачу мониторинга в планировщик.
+    def add_monitors(self):
+        """Добавить все мониторы"""
+        self.monitors = [
+            ShalomSiteMonitor(),
+            AfishaMonitor(),
+            MosbiletMonitor(),
+            TelegramChannelMonitor(),
+            VKGroupMonitor()
+        ]
+        logger.info(f"✓ Добавлено мониторов: {len(self.monitors)}")
 
-        Args:
-            monitor_id: Уникальный идентификатор задачи.
-            func: Асинхронная функция проверки.
-            interval_seconds: Интервал запуска в секундах.
-        """
-        self._scheduler.add_job(
-            func,
-            trigger=IntervalTrigger(seconds=interval_seconds),
-            id=monitor_id,
-            replace_existing=True,
-            misfire_grace_time=30,
-        )
-        logger.info("Задача '%s' добавлена (каждые %ds)", monitor_id, interval_seconds)
+    async def start_all(self):
+        """Запустить все мониторы"""
+        logger.info("🚀 Запуск всех мониторов...")
 
-    def update_interval(self, monitor_id: str, interval_seconds: int) -> None:
-        """Изменяет интервал существующей задачи."""
-        job = self._scheduler.get_job(monitor_id)
-        if job:
-            job.reschedule(trigger=IntervalTrigger(seconds=interval_seconds))
-            logger.info("Интервал задачи '%s' изменён на %ds", monitor_id, interval_seconds)
+        for monitor in self.monitors:
+            task = asyncio.create_task(monitor.run())
+            self.tasks.append(task)
 
-    def start(self) -> None:
-        """Запускает планировщик."""
-        self._scheduler.start()
-        logger.info("Планировщик запущен")
+        logger.info(f"✓ Запущено задач мониторинга: {len(self.tasks)}")
 
-    def shutdown(self) -> None:
-        """Останавливает планировщик."""
-        self._scheduler.shutdown(wait=False)
-        logger.info("Планировщик остановлен")
+    async def stop_all(self):
+        """Остановить все мониторы"""
+        logger.info("⏹ Остановка всех мониторов...")
+
+        for task in self.tasks:
+            task.cancel()
+
+        # Ожидание завершения всех задач
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+
+        logger.info("✓ Все мониторы остановлены")

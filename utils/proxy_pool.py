@@ -1,63 +1,69 @@
 """
-Модуль управления пулом прокси-серверов.
-
-Обеспечивает ротацию прокси при HTTP-запросах мониторов,
-отслеживает работоспособность прокси и исключает нерабочие
-адреса из ротации.
+Управление пулом прокси
+Ротация и проверка работоспособности прокси
 """
 
-import asyncio
-import itertools
+from typing import List, Optional
+from config.settings import settings
 import logging
-from typing import Iterator
-
-import aiohttp
 
 logger = logging.getLogger(__name__)
 
 
 class ProxyPool:
-    """Пул прокси с автоматической ротацией."""
+    """Пул прокси с ротацией"""
 
-    def __init__(self, proxies: list[str]) -> None:
+    def __init__(self, proxies: List[str] = None):
         """
         Args:
-            proxies: Список URL прокси в формате http://host:port.
+            proxies: Список прокси в формате http://host:port
         """
-        self._all: list[str] = proxies
-        self._healthy: list[str] = list(proxies)
-        self._cycle: Iterator[str] = itertools.cycle(self._healthy)
+        self.proxies = proxies or settings.PROXY_LIST
+        self.current_index = 0
+        self.failed_proxies = set()
 
-    def next(self) -> str | None:
-        """Возвращает следующий прокси из пула или None, если пул пуст."""
-        if not self._healthy:
+        if self.proxies:
+            logger.info(f"✓ Инициализирован пул из {len(self.proxies)} прокси")
+        else:
+            logger.info("ℹ️ Прокси не настроены, работа без прокси")
+
+    def get_next(self) -> Optional[str]:
+        """
+        Получить следующий прокси из пула
+
+        Returns:
+            URL прокси или None
+        """
+        if not self.proxies:
             return None
-        return next(self._cycle)
 
-    def mark_failed(self, proxy: str) -> None:
-        """Помечает прокси как нерабочий и удаляет из ротации."""
-        if proxy in self._healthy:
-            self._healthy.remove(proxy)
-            self._cycle = itertools.cycle(self._healthy)
-            logger.warning("Прокси %s удалён из пула (%d осталось)", proxy, len(self._healthy))
+        # Пропускаем неработающие прокси
+        attempts = 0
+        while attempts < len(self.proxies):
+            proxy = self.proxies[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.proxies)
 
-    async def check_all(self, test_url: str = "https://httpbin.org/ip") -> None:
-        """Проверяет все прокси и обновляет список рабочих."""
-        results: list[str] = []
-        async with aiohttp.ClientSession() as session:
-            tasks = [self._check_one(session, p, test_url) for p in self._all]
-            checks = await asyncio.gather(*tasks, return_exceptions=True)
-        for proxy, ok in zip(self._all, checks):
-            if ok is True:
-                results.append(proxy)
-        self._healthy = results
-        self._cycle = itertools.cycle(self._healthy)
-        logger.info("Проверка прокси завершена: %d/%d рабочих", len(self._healthy), len(self._all))
+            if proxy not in self.failed_proxies:
+                return proxy
 
-    @staticmethod
-    async def _check_one(session: aiohttp.ClientSession, proxy: str, url: str) -> bool:
-        try:
-            async with session.get(url, proxy=proxy, timeout=5):
-                return True
-        except Exception:
-            return False
+            attempts += 1
+
+        # Если все прокси в failed - сбрасываем список и пробуем снова
+        if self.failed_proxies:
+            logger.warning("⚠️ Все прокси помечены как неработающие, сброс списка")
+            self.failed_proxies.clear()
+            return self.proxies[0]
+
+        return None
+
+    def mark_failed(self, proxy: str):
+        """Пометить прокси как неработающий"""
+        if proxy and proxy not in self.failed_proxies:
+            self.failed_proxies.add(proxy)
+            logger.warning(f"⚠️ Прокси помечен как неработающий: {proxy}")
+
+    def mark_success(self, proxy: str):
+        """Пометить прокси как работающий"""
+        if proxy in self.failed_proxies:
+            self.failed_proxies.remove(proxy)
+            logger.info(f"✓ Прокси восстановлен: {proxy}")

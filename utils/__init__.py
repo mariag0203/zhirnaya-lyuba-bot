@@ -1,6 +1,12 @@
 """
-Пакет utils.
-
-Содержит вспомогательные утилиты: пул прокси-серверов
-и планировщик периодических задач мониторинга.
+Utils package
+Вспомогательные утилиты
 """
+
+from utils.proxy_pool import ProxyPool
+from utils.scheduler import MonitorScheduler
+
+__all__ = [
+    'ProxyPool',
+    'MonitorScheduler'
+]

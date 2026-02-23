@@ -1,51 +1,79 @@
 """
-Монитор группы ВКонтакте.
-
-Периодически опрашивает стену VK-группы театра через VK API
-на предмет новых записей, содержащих информацию о билетах.
+Монитор VK группы театра "Шалом"
+Отслеживает новые посты в группе vk.com/teatrshalom
 """
 
-import logging
-from typing import Any
-
-import vk_api
-
 from monitors.base_monitor import BaseMonitor
-from config.settings import VK_TOKEN
+from typing import List, Dict, Any
+from config.settings import settings
+import logging
 
 logger = logging.getLogger(__name__)
 
 
 class VKGroupMonitor(BaseMonitor):
-    """Монитор VK-группы через vk-api."""
+    """Монитор VK группы"""
 
-    name = "vk_group"
+    def __init__(self):
+        super().__init__(source_name='vk')
+        self.group_id = settings.VK_GROUP_ID
+        self.last_post_id = 0
 
-    TICKET_KEYWORDS = ("билет", "ticket", "купить", "продажа", "доступны")
+    async def initialize(self):
+        """Инициализация монитора"""
+        await super().initialize()
 
-    def __init__(self, group_id: str, **kwargs: Any) -> None:
+        # Проверяем наличие токена
+        if not settings.VK_TOKEN:
+            logger.warning(f"⚠️ {self.source_name}: VK_TOKEN не установлен")
+            logger.warning(f"   Монитор VK группы будет отключен")
+            return
+
+        logger.info(f"✓ {self.source_name}: инициализация завершена (заглушка)")
+
+    async def check_source(self) -> List[Dict[str, Any]]:
         """
-        Args:
-            group_id: Числовой ID или короткое имя группы ВКонтакте.
+        Проверка новых постов в группе
+
+        Returns:
+            Список найденных анонсов
         """
-        super().__init__(**kwargs)
-        self.group_id = group_id
-        self._vk: vk_api.vk_api.VkApiMethod | None = None
+        # Заглушка - реальная реализация требует VK API
+        if not settings.VK_TOKEN:
+            return []
 
-    def _get_vk(self) -> vk_api.vk_api.VkApiMethod:
-        if self._vk is None:
-            session = vk_api.VkApi(token=VK_TOKEN)
-            self._vk = session.get_api()
-        return self._vk
+        announcements = []
 
-    async def check(self) -> dict[str, Any] | None:
-        """Проверяет последние записи на стене VK-группы."""
-        vk = self._get_vk()
-        posts = vk.wall.get(owner_id=f"-{self.group_id}", count=5)
-        for item in posts.get("items", []):
-            text = (item.get("text") or "").lower()
-            if any(kw in text for kw in self.TICKET_KEYWORDS):
-                post_url = f"https://vk.com/wall-{self.group_id}_{item['id']}"
-                logger.info("[%s] Найдена запись о билетах: %s", self.name, post_url)
-                return {"source": self.name, "url": post_url, "text": item.get("text")}
-        return None
+        # TODO: Реальная реализация с VK API
+        # import vk_api
+        # vk_session = vk_api.VkApi(token=settings.VK_TOKEN)
+        # vk = vk_session.get_api()
+        #
+        # response = vk.wall.get(domain=self.group_id, count=10)
+        # posts = response['items']
+        #
+        # for post in posts:
+        #     if post['id'] <= self.last_post_id:
+        #         continue
+        #
+        #     text = post.get('text', '')
+        #
+        #     # Проверяем ключевые слова
+        #     has_required = any(kw.lower() in text.lower()
+        #                       for kw in settings.KEYWORDS_REQUIRED)
+        #     has_sale = any(kw.lower() in text.lower()
+        #                   for kw in settings.KEYWORDS_SALE)
+        #
+        #     if has_required and has_sale:
+        #         post_url = f"https://vk.com/wall-{response['groups'][0]['id']}_{post['id']}"
+        #         announcements.append({
+        #             'source': self.source_name,
+        #             'text': text[:500],
+        #             'url': post_url,
+        #             'date': post['date']
+        #         })
+        #
+        #     self.last_post_id = max(self.last_post_id, post['id'])
+
+        logger.debug(f"{self.source_name}: проверка завершена (заглушка)")
+        return announcements
