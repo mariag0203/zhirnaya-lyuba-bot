@@ -70,7 +70,7 @@ async def cmd_start(message: Message):
 Как только появятся билеты — я сразу сообщу.
     """.strip()
 
-    await message.answer(welcome_text, parse_mode="Markdown")
+    await message.answer(welcome_text)
 
 
 @router.message(Command("status"))
@@ -119,25 +119,25 @@ async def cmd_status(message: Message):
 
         status_text += f"\n\n{settings.get_info()}"
 
-    await message.answer(status_text, parse_mode="Markdown")
+    await message.answer(status_text)
 
 
 @router.message(Command("subscribe"))
 async def cmd_subscribe(message: Message):
     """Команда /subscribe - включить уведомления"""
-    async with async_session_maker() as session:
-        user = await get_or_create_user(message)
+    user = await get_or_create_user(message)
 
-        if user.is_subscribed:
-            await message.answer("✅ Вы уже подписаны на уведомления!")
-        else:
+    if user.is_subscribed:
+        await message.answer("✅ Вы уже подписаны на уведомления!")
+    else:
+        async with async_session_maker() as session:
             await session.execute(
                 update(User)
                 .where(User.chat_id == message.chat.id)
                 .values(is_subscribed=True)
             )
             await session.commit()
-            await message.answer("✅ Уведомления включены! Я сообщу, когда появятся билеты.")
+        await message.answer("✅ Уведомления включены! Я сообщу, когда появятся билеты.")
 
 
 @router.message(Command("unsubscribe"))
