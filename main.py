@@ -6,6 +6,7 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from config.settings import settings
 from database import init_db, close_db
@@ -45,7 +46,7 @@ async def main():
     await init_db()
 
     # Создание бота и диспетчера
-    bot = Bot(token=settings.BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
+    bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher()
     dp.include_router(router)
 
