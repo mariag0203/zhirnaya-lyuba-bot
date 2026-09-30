@@ -1,237 +1,110 @@
 """
-Система уведомлений - отправка сообщений пользователям
+Рассылка уведомлений подписчикам
 """
 
-from aiogram import Bot
-from sqlalchemy import select
-from database.models import User, NotificationLog, TicketEvent
-from database.db import async_session_maker
-from datetime import datetime
 import logging
+from datetime import datetime
+from typing import Optional
+
+from aiogram import Bot
+from aiogram.exceptions import TelegramForbiddenError
+from sqlalchemy import select, update
+
+from config.settings import settings
+from database.db import async_session_maker
+from database.models import User, NotificationLog, Show
+from utils.timefmt import fmt_show, now_msk
 
 logger = logging.getLogger(__name__)
 
 
-async def broadcast(
-    bot: Bot,
-    message: str,
-    notification_type: str = "info",
-    event_id: int = None,
-    parse_mode: str = "Markdown"
-) -> int:
-    """
-    Рассылка сообщения всем подписанным пользователям
+async def broadcast(bot: Optional[Bot], message: str, notification_type: str,
+                    show_id: Optional[int] = None) -> int:
+    """Отправить сообщение всем подписчикам (и администратору). Возвращает число доставленных."""
+    if bot is None:
+        logger.info(f"(бот не задан, рассылка пропущена) {message!r}")
+        return 0
 
-    Args:
-        bot: Экземпляр aiogram Bot
-        message: Текст сообщения
-        notification_type: Тип уведомления (new_sale, returned_tickets, announcement)
-        event_id: ID события из TicketEvent (если применимо)
-        parse_mode: Режим парсинга (Markdown/HTML)
-
-    Returns:
-        Количество успешно отправленных сообщений
-    """
     async with async_session_maker() as session:
-        # Получаем всех подписанных пользователей
-        result = await session.execute(
-            select(User).where(User.is_subscribed == True)
-        )
-        users = result.scalars().all()
+        res = await session.execute(select(User).where(User.is_subscribed == True))  # noqa: E712
+        chat_ids = [u.chat_id for u in res.scalars().all()]
+    if settings.ADMIN_CHAT_ID and settings.ADMIN_CHAT_ID not in chat_ids:
+        chat_ids.append(settings.ADMIN_CHAT_ID)
 
-        success_count = 0
-        failed_users = []
+    ok, failed, blocked = 0, [], []
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id=chat_id, text=message, parse_mode=None,
+                                   disable_web_page_preview=True)
+            ok += 1
+        except TelegramForbiddenError:
+            # Пользователь заблокировал бота — больше ему не пишем
+            blocked.append(chat_id)
+        except Exception as e:
+            failed.append(chat_id)
+            logger.error(f"✗ Ошибка отправки {chat_id}: {e}")
 
-        for user in users:
-            try:
-                await bot.send_message(
-                    chat_id=user.chat_id,
-                    text=message,
-                    parse_mode=parse_mode
-                )
-                success_count += 1
-                logger.info(f"✓ Уведомление отправлено: {user.chat_id}")
-            except Exception as e:
-                failed_users.append(user.chat_id)
-                logger.error(f"✗ Ошибка отправки {user.chat_id}: {e}")
-
-        # Логируем результат рассылки
-        log_entry = NotificationLog(
-            event_id=event_id,
+    async with async_session_maker() as session:
+        if blocked:
+            await session.execute(update(User).where(User.chat_id.in_(blocked)).values(is_subscribed=False))
+            logger.info(f"Бота заблокировали, отписаны: {blocked}")
+        session.add(NotificationLog(
+            event_id=show_id,
             notification_type=notification_type,
             message=message,
-            recipients_count=success_count,
+            recipients_count=ok,
             sent_at=datetime.utcnow(),
-            success=(len(failed_users) == 0),
-            error_text=f"Failed for: {failed_users}" if failed_users else None
-        )
-        session.add(log_entry)
+            success=not failed,
+            error_text=f"Failed for: {failed}" if failed else None,
+        ))
         await session.commit()
 
-        logger.info(f"📨 Рассылка завершена: {success_count}/{len(users)} успешно")
-        return success_count
+    logger.info(f"📨 Рассылка ({notification_type}): {ok}/{len(chat_ids)} доставлено")
+    return ok
 
 
-async def notify_tickets_found(
-    bot: Bot,
-    event_date: str,
-    venue: str,
-    links: dict
-) -> int:
-    """
-    Уведомление об открытии продаж билетов
+def _seats_line(show: Show) -> str:
+    n = show.free_seats or 0
+    line = f"{n} {plural(n, 'место', 'места', 'мест')}"
+    if show.min_price:
+        line += f", от {show.min_price} ₽"
+    return line
 
-    Args:
-        bot: Экземпляр aiogram Bot
-        event_date: Дата спектакля (строка, например "06 марта, 19:00")
-        venue: Площадка
-        links: Словарь со ссылками {source: url}
 
-    Returns:
-        Количество отправленных уведомлений
-    """
-    message_lines = [
-        "🚨 **СТАРТ ПРОДАЖ!** 🚨",
+def plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return many
+    n %= 10
+    if n == 1:
+        return one
+    if 2 <= n <= 4:
+        return few
+    return many
+
+
+async def notify_new_show(bot: Optional[Bot], show: Show, opening_date: Optional[datetime],
+                          url: str, seats_known: bool = True) -> int:
+    lines = [
+        "🆕 Новый показ «Жирной Любы»",
+        f"{fmt_show(show.starts_at)}",
         "",
-        "**Спектакль:** Жирная Люба",
-        f"**Дата:** {event_date}",
-        f"**Площадка:** {venue}",
-        "",
-        "**Ссылки на покупку (КЛИКАЙ БЫСТРО):**"
     ]
+    if (show.free_seats or 0) > 0:
+        lines.append(f"Сейчас свободно: {_seats_line(show)}")
+    elif opening_date and opening_date > now_msk().replace(tzinfo=None):
+        lines.append(f"Продажа на Мосбилете откроется {opening_date:%d.%m в %H:%M}")
+    elif seats_known:
+        lines.append("Свободных мест на Мосбилете сейчас нет")
+    lines += ["", f"Выбор мест: {url}", f"(в расписании на странице выберите {show.starts_at:%d.%m})"]
+    return await broadcast(bot, "\n".join(lines), 'new_show', show.id)
 
-    # Добавляем ссылки из разных источников
-    source_names = {
-        'shalom_site': '🎭 Офиц. сайт',
-        'afisha': '🎫 Afisha',
-        'mosbilet': '🏛 Мосбилет'
-    }
 
-    for source, url in links.items():
-        name = source_names.get(source, source)
-        message_lines.append(f"{name}: {url}")
-
-    message = "\n".join(message_lines)
-
-    return await broadcast(
-        bot=bot,
-        message=message,
-        notification_type="new_sale"
+async def notify_seats(bot: Optional[Bot], show: Show, url: str) -> int:
+    text = (
+        f"🎫 {fmt_show(show.starts_at)} — появилось {_seats_line(show)}\n"
+        f"\n"
+        f"Выбор мест: {url}\n"
+        f"(в расписании на странице выберите {show.starts_at:%d.%m})"
     )
-
-
-async def notify_returned_tickets(
-    bot: Bot,
-    event_date: str,
-    venue: str,
-    source: str,
-    url: str
-) -> int:
-    """
-    Уведомление о возвращенных билетах
-
-    Args:
-        bot: Экземпляр aiogram Bot
-        event_date: Дата спектакля
-        venue: Площадка
-        source: Источник (shalom_site, afisha, mosbilet)
-        url: Ссылка на покупку
-
-    Returns:
-        Количество отправленных уведомлений
-    """
-    source_names = {
-        'shalom_site': 'Офиц. сайт',
-        'afisha': 'Afisha.ru',
-        'mosbilet': 'Мосбилет'
-    }
-    source_name = source_names.get(source, source)
-
-    message = f"""
-🔄 **ОСВОБОДИЛИСЬ БИЛЕТЫ!**
-
-**Спектакль:** Жирная Люба
-**Дата:** {event_date}
-**Площадка:** {venue}
-
-Кто-то не оплатил бронь, билеты вернулись в продажу!
-
-**Источник:** {source_name}
-**Ссылка:** {url}
-    """.strip()
-
-    return await broadcast(
-        bot=bot,
-        message=message,
-        notification_type="returned_tickets"
-    )
-
-
-async def notify_announcement(
-    bot: Bot,
-    announcement_text: str,
-    source: str,
-    source_url: str
-) -> int:
-    """
-    Уведомление об анонсе от театра
-
-    Args:
-        bot: Экземпляр aiogram Bot
-        announcement_text: Текст анонса
-        source: Источник (telegram, vk, website)
-        source_url: Ссылка на пост/новость
-
-    Returns:
-        Количество отправленных уведомлений
-    """
-    source_names = {
-        'telegram': '📱 Telegram-канал',
-        'vk': '💬 VK группа',
-        'website': '🌐 Сайт театра'
-    }
-    source_name = source_names.get(source, source)
-
-    message = f"""
-📢 **АНОНС ОТ ТЕАТРА**
-
-**Источник:** {source_name}
-
-{announcement_text}
-
-**Оригинал:** {source_url}
-    """.strip()
-
-    return await broadcast(
-        bot=bot,
-        message=message,
-        notification_type="announcement"
-    )
-
-
-async def notify_admin(
-    bot: Bot,
-    admin_chat_id: int,
-    message: str
-) -> bool:
-    """
-    Отправка уведомления администратору (для отладки/ошибок)
-
-    Args:
-        bot: Экземпляр aiogram Bot
-        admin_chat_id: Chat ID администратора
-        message: Текст сообщения
-
-    Returns:
-        True если отправлено успешно
-    """
-    try:
-        await bot.send_message(
-            chat_id=admin_chat_id,
-            text=f"🔧 **ADMIN NOTIFICATION**\n\n{message}",
-            parse_mode="Markdown"
-        )
-        return True
-    except Exception as e:
-        logger.error(f"✗ Ошибка отправки админу: {e}")
-        return False
+    return await broadcast(bot, text, 'seats', show.id)

@@ -1,236 +1,265 @@
 """
-Монитор Мосбилет (bilet.mos.ru)
-Отслеживает события театра "Шалом" на портале bilet.mos.ru
+Монитор Мосбилета (bilet.mos.ru) для одного спектакля.
+
+Источники (те же, что использует сама страница https://bilet.mos.ru/event/<ID>/):
+  1. /api/newsfeed/v4/frontend/json/ru/afisha/<ID>
+       карточка события: ebs_id и agent_uid в билетной системе, общий флаг
+       «есть места», дата открытия продаж
+  2. /api/newsfeed/v4/frontend/json/ru/afisha/<ID>/occurrences
+       ВСЕ показы с датой и временем, в том числе распроданные. По этому списку бот
+       узнаёт о новых показах (26.09 внеплановый показ на 27.09 появился именно здесь).
+  3. https://tickets-external.mos.ru/api/widget/v2/event/<ebs_id>/performances
+       расписание из билетной системы: по каждому показу, на который ЕСТЬ места,
+       число свободных мест и минимальная цена в рублях. Распроданные показы сюда
+       не попадают, поэтому их нет — значит 0 мест.
+
+Три GET-запроса за цикл, цикл раз в BASE_INTERVAL секунд (не чаще раза в минуту).
 """
 
-from monitors.base_monitor import BaseMonitor
-from bs4 import BeautifulSoup
-from typing import List, Dict, Any, Optional
-from config.settings import settings
 import logging
-import re
-import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import select
+
+from config.settings import settings
+from database.db import async_session_maker
+from database.models import Show
+from monitors.base_monitor import BaseMonitor, RequestError
+from utils.timefmt import now_msk, parse_site_dt, fmt_show
 
 logger = logging.getLogger(__name__)
 
+NEWSFEED = '/api/newsfeed/v4/frontend/json/ru/afisha'
+PERF_DAYS_PER_PAGE = 10
+
+
+class ParseError(Exception):
+    """Ответ пришёл, но в нём не то, что мы ожидаем (похоже, сайт поменялся)."""
+
+
+@dataclass
+class SeatInfo:
+    performance_id: Optional[int]
+    free_seats: int
+    min_price: Optional[int]
+
 
 class MosbiletMonitor(BaseMonitor):
-    """Монитор Мосбилет"""
-
-    def __init__(self):
-        super().__init__(source_name='mosbilet')
+    def __init__(self, bot=None):
+        super().__init__(source_name='mosbilet', bot=bot)
+        self.event_id = settings.MOSBILET_EVENT_ID
         self.base_url = settings.MOSBILET_BASE_URL
-        self.known_events = set()
+        self.tickets_url = settings.TICKETS_BASE_URL
+        self.empty_alerted = False
+        self.opening_date: Optional[datetime] = None
+        self.event_title: str = 'Жирная Люба'
 
-        # Известные ID событий (можно добавлять вручную в конфиг)
-        self.event_ids = []  # Например: ['381336257']
+    # ---------- получение данных ----------
 
-    async def check_source(self) -> List[Dict[str, Any]]:
-        """Проверка событий на Мосбилет"""
-        events = []
+    async def fetch_event(self) -> Dict[str, Any]:
+        data = await self.get_json(f"{self.base_url}{NEWSFEED}/{self.event_id}")
+        if not isinstance(data, dict) or data.get('id') != self.event_id:
+            raise ParseError('карточка события: нет поля id или id другой')
+        if not data.get('ebs_id') or not data.get('ebs_agent_uid'):
+            raise ParseError('карточка события: нет ebs_id / ebs_agent_uid')
+        return data
 
-        # Стратегия 1: Проверка известных ID событий
-        for event_id in self.event_ids:
-            event_url = f"{self.base_url}/event/{event_id}/"
-            event_data = await self._check_event_page(event_url, event_id)
-            if event_data:
-                events.append(event_data)
+    async def fetch_occurrences(self) -> List[datetime]:
+        data = await self.get_json(
+            f"{self.base_url}{NEWSFEED}/{self.event_id}/occurrences",
+            params={'per-page': 50},
+        )
+        items = data.get('items') if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise ParseError('список показов: нет поля items')
+        result = []
+        for it in items:
+            dt = parse_site_dt(it.get('date_from', '')) if isinstance(it, dict) else None
+            if dt is None:
+                raise ParseError(f'список показов: не разобрать дату в {str(it)[:100]}')
+            result.append(dt)
+        return result
 
-        # Стратегия 2: Поиск по организатору
-        search_events = await self._search_by_organizer()
-        events.extend(search_events)
+    async def fetch_seats(self, ebs_id: int, agent_uid: str) -> Dict[datetime, SeatInfo]:
+        """Места по показам. Распроданных показов в ответе нет."""
+        seats: Dict[datetime, SeatInfo] = {}
+        date_from = now_msk().date()
+        for _ in range(5):  # страницы по PERF_DAYS_PER_PAGE дней с показами
+            data = await self.get_json(
+                f"{self.tickets_url}/api/widget/v2/event/{ebs_id}/performances",
+                params={
+                    'date_from': date_from.isoformat(),
+                    'date_to': '',
+                    'performances_limit_by_days': PERF_DAYS_PER_PAGE,
+                    'agent_id': agent_uid,
+                },
+            )
+            if not isinstance(data, list):
+                raise ParseError('билетная система: ожидался список дней')
+            for day in data:
+                for p in (day or {}).get('performances') or []:
+                    dt = parse_site_dt(p.get('start_datetime', ''))
+                    free = p.get('free_seats_count')
+                    if dt is None or not isinstance(free, int):
+                        raise ParseError(f'билетная система: неожиданный показ {str(p)[:120]}')
+                    price = p.get('min_performance_price')
+                    seats[dt] = SeatInfo(
+                        performance_id=p.get('id'),
+                        free_seats=max(0, free),
+                        min_price=int(price) if isinstance(price, (int, float)) else None,
+                    )
+            if len(data) < PERF_DAYS_PER_PAGE:
+                break
+            last = parse_site_dt(data[-1].get('date', '') + ' 00:00')
+            if not last:
+                break
+            date_from = (last + timedelta(days=1)).date()
+        return seats
 
-        return events
+    # ---------- одна проверка ----------
 
-    async def _check_event_page(self, url: str, event_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Проверить страницу конкретного события
+    async def check(self) -> None:
+        try:
+            event = await self.fetch_event()
+            occurrences = await self.fetch_occurrences()
+        except ParseError as e:
+            await self._register_empty(f"ответ сайта не разобран: {e}")
+            raise
 
-        Args:
-            url: URL страницы события
-            event_id: ID события
-
-        Returns:
-            Данные события или None
-        """
-        response = await self.make_request(url)
-
-        if not response:
-            return None
+        self.event_title = event.get('title') or self.event_title
+        self.opening_date = parse_site_dt(event.get('ebs_opening_date') or '')
+        flag = event.get('ebs_has_available_seats')
 
         try:
-            html = await response.text()
-            soup = BeautifulSoup(html, 'lxml')
+            seats = await self.fetch_seats(int(event['ebs_id']), str(event['ebs_agent_uid']))
+            self.health.seats_source_ok = True
+        except (RequestError, ParseError) as e:
+            # Без билетной системы новые показы всё равно видны; места — нет.
+            logger.warning(f"{self.source_name}: места по показам не получены: {e}")
+            self.health.seats_source_ok = False
+            self.health.last_error = f"места по показам не получены: {e}"
+            seats = None
 
-            # Проверяем название события
-            title = soup.find(['h1', 'h2'], class_=re.compile(r'title|name|event', re.I))
-            if not title:
-                title = soup.find('h1')
+        now = now_msk().replace(tzinfo=None)
+        shows = {dt for dt in occurrences if dt > now}
+        if seats:
+            shows |= {dt for dt in seats if dt > now}
 
-            if not title:
-                return None
+        if not any(dt > now for dt in occurrences):
+            # Даже если билетная система что-то вернула: пустой список показов
+            # на странице события — признак, что разбор сломался
+            await self._register_empty('в расписании на странице спектакля не найдено ни одного будущего показа')
+        else:
+            await self._register_found()
 
-            title_text = title.get_text().strip()
+        await self.sync_shows(sorted(shows), seats)
 
-            # Проверяем, это "Жирная Люба"
-            if not any(keyword.lower() in title_text.lower()
-                      for keyword in settings.KEYWORDS_REQUIRED):
-                return None
+        total = sum(s.free_seats for s in (seats or {}).values())
+        self.health.shows_found = len(shows)
+        self.health.free_seats_total = total
+        summary = ', '.join(
+            f"{d:%d.%m %H:%M}={seats[d].free_seats if seats and d in seats else (0 if seats is not None else '?')}"
+            for d in sorted(shows)
+        ) or 'нет'
+        logger.info(f"{self.source_name}: показов {len(shows)}, места: {summary}; флаг афиши: {flag}")
+        if seats is not None and bool(flag) != (total > 0):
+            logger.info(f"{self.source_name}: флаг афиши ({flag}) расходится с билетной системой ({total} мест)")
 
-            # Ищем кнопку покупки
-            buy_button = soup.find(['a', 'button'],
-                                  text=re.compile(r'купить|билеты|заказать', re.I))
+    async def _register_empty(self, reason: str):
+        h = self.health
+        h.consecutive_empty += 1
+        if h.consecutive_empty >= settings.PARSE_ALERT_AFTER and not self.empty_alerted:
+            self.empty_alerted = True
+            await self.alert_admin(
+                f"⚠️ Мосбилет: {h.consecutive_empty} проверок подряд — {reason}.\n"
+                "Скорее всего, сайт поменял вёрстку или API, и бот сейчас ничего не видит. "
+                "Если показы спектакля просто закончились, это тоже объяснение.\n"
+                f"{settings.event_url}"
+            )
 
-            if not buy_button:
-                # Альтернативный поиск по классам
-                buy_button = soup.find(['a', 'button'],
-                                      class_=re.compile(r'buy|ticket|order|purchase', re.I))
+    async def _register_found(self):
+        if self.empty_alerted:
+            await self.alert_admin("✅ Мосбилет: показы снова находятся, разбор работает")
+        self.empty_alerted = False
+        self.health.consecutive_empty = 0
 
-            # Проверяем статус доступности
-            availability_text = soup.get_text()
+    # ---------- сравнение с базой и уведомления ----------
 
-            # Признаки того, что билеты НЕ доступны
-            unavailable_markers = [
-                'нет билетов',
-                'sold out',
-                'распродано',
-                'продажа завершена',
-                'мероприятие состоялось'
-            ]
+    async def sync_shows(self, shows: List[datetime], seats: Optional[Dict[datetime, SeatInfo]]):
+        from bot.notifications import notify_new_show, notify_seats
 
-            is_unavailable = any(marker in availability_text.lower()
-                                for marker in unavailable_markers)
+        utcnow = datetime.utcnow()
+        cooldown = timedelta(minutes=settings.NOTIFY_COOLDOWN_MIN)
+        to_notify_new: List[Show] = []
+        to_notify_seats: List[Show] = []
 
-            # Если билеты недоступны и нет кнопки покупки - пропускаем
-            if is_unavailable and not buy_button:
-                return None
+        async with async_session_maker() as session:
+            res = await session.execute(select(Show).where(Show.event_id == self.event_id))
+            rows = {r.starts_at: r for r in res.scalars().all()}
+            first_run = not rows
 
-            # Если есть кнопка покупки или билеты доступны
-            if buy_button or not is_unavailable:
-                # Проверяем новизну
-                if url in self.known_events:
-                    return None
+            for dt in shows:
+                info = seats.get(dt) if seats is not None else None
+                row = rows.get(dt)
+                if row is None:
+                    row = Show(event_id=self.event_id, starts_at=dt, free_seats=0,
+                               first_seen_at=utcnow, last_seen_at=utcnow, is_listed=True)
+                    session.add(row)
+                    rows[dt] = row
+                    logger.info(f"{self.source_name}: новый показ {dt:%d.%m.%Y %H:%M}")
+                    if not first_run:
+                        to_notify_new.append(row)
+                elif not row.is_listed:
+                    row.is_listed = True
+                    logger.info(f"{self.source_name}: показ {dt:%d.%m.%Y %H:%M} снова в расписании")
 
-                # Извлекаем дату и площадку
-                event_date = self._extract_date(availability_text)
-                venue = self._extract_venue(availability_text)
+                row.last_seen_at = utcnow
+                if seats is None:
+                    continue  # мест не знаем — состояние не трогаем
 
-                self.known_events.add(url)
+                prev = row.free_seats or 0
+                now_free = info.free_seats if info else 0
+                if info:
+                    row.performance_id = info.performance_id or row.performance_id
+                    row.min_price = info.min_price
+                if now_free != prev:
+                    row.free_seats = now_free
+                    row.seats_changed_at = utcnow
+                    logger.info(f"{self.source_name}: {dt:%d.%m %H:%M} мест {prev} -> {now_free}")
 
-                logger.info(f"✓ {self.source_name}: новое событие #{event_id}")
+                if prev == 0 and now_free > 0 and row not in to_notify_new:
+                    recent = row.last_seats_notified_at and utcnow - row.last_seats_notified_at < cooldown
+                    if recent:
+                        logger.info(f"{self.source_name}: {dt:%d.%m %H:%M} — места снова есть, "
+                                    f"но уведомление было меньше {settings.NOTIFY_COOLDOWN_MIN} мин назад")
+                    else:
+                        to_notify_seats.append(row)
 
-                return {
-                    'source': self.source_name,
-                    'url': url,
-                    'event_date': event_date,
-                    'venue': venue,
-                    'raw_text': title_text
-                }
+            listed = set(shows)
+            for dt, row in rows.items():
+                if row.is_listed and dt not in listed:
+                    row.is_listed = False
+                    logger.info(f"{self.source_name}: показ {dt:%d.%m.%Y %H:%M} пропал из расписания "
+                                f"(прошёл или снят)")
 
-        except Exception as e:
-            logger.error(f"✗ {self.source_name}: ошибка парсинга события {event_id}: {e}")
+            for row in to_notify_new + to_notify_seats:
+                if (row.free_seats or 0) > 0:
+                    row.last_seats_notified_at = utcnow
+            await session.commit()
 
-        return None
+        if first_run and shows:
+            await self.alert_admin(
+                "Начинаю следить за показами «" + self.event_title + "»:\n" +
+                '\n'.join(f"• {fmt_show(dt)} — мест: "
+                          f"{rows[dt].free_seats if seats is not None else '?'}" for dt in shows)
+            )
 
-    async def _search_by_organizer(self) -> List[Dict[str, Any]]:
-        """
-        Поиск событий театра "Шалом" через поиск или список организатора
-
-        Returns:
-            Список найденных событий
-        """
-        events = []
-
-        # Пробуем разные варианты поиска
-        search_queries = [
-            'Жирная Люба',
-            'Шалом театр',
-            'Московский еврейский театр'
-        ]
-
-        for query in search_queries:
-            search_url = f"{self.base_url}/search/?q={query.replace(' ', '+')}"
-
-            response = await self.make_request(search_url)
-
-            if not response:
-                continue
-
-            try:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'lxml')
-
-                # Ищем карточки событий в результатах поиска
-                event_cards = soup.find_all(['div', 'article', 'li'],
-                                           class_=re.compile(r'event|card|item|result', re.I))
-
-                for card in event_cards:
-                    card_text = card.get_text()
-
-                    # Проверяем упоминание "Жирная Люба"
-                    if not any(keyword.lower() in card_text.lower()
-                              for keyword in settings.KEYWORDS_REQUIRED):
-                        continue
-
-                    # Ищем ссылку на событие
-                    link = card.find('a', href=re.compile(r'/event/\d+'))
-
-                    if not link:
-                        continue
-
-                    event_url = link['href']
-                    if not event_url.startswith('http'):
-                        event_url = self.base_url + event_url
-
-                    # Извлекаем ID события из URL
-                    event_id_match = re.search(r'/event/(\d+)', event_url)
-                    if event_id_match:
-                        event_id = event_id_match.group(1)
-
-                        # Добавляем в список известных ID для будущих проверок
-                        if event_id not in self.event_ids:
-                            self.event_ids.append(event_id)
-                            logger.info(f"✓ Обнаружен новый ID события: {event_id}")
-
-                    # Проверяем эту страницу события
-                    event_data = await self._check_event_page(event_url, event_id)
-                    if event_data:
-                        events.append(event_data)
-
-            except Exception as e:
-                logger.error(f"✗ {self.source_name}: ошибка поиска по '{query}': {e}")
-
-        return events
-
-    def _extract_date(self, text: str) -> Optional[str]:
-        """Извлечь дату из текста"""
-        patterns = [
-            r'(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{4})?',
-            r'(\d{1,2})\.(\d{1,2})\.(\d{4})',
-            r'(\d{4})-(\d{2})-(\d{2})',
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text, re.I)
-            if match:
-                return match.group(0)
-
-        return None
-
-    def _extract_venue(self, text: str) -> str:
-        """Извлечь площадку из текста"""
-        venues = [
-            'Новослободская',
-            'Варшавка',
-            'Большая сцена',
-            'Малая сцена',
-            'Новая сцена',
-            'Шалом'
-        ]
-
-        text_lower = text.lower()
-        for venue in venues:
-            if venue.lower() in text_lower:
-                return venue
-
-        return "Театр Шалом"
+        for row in to_notify_new:
+            self.health.day_notifications += 1
+            await notify_new_show(self.bot, row, self.opening_date, settings.event_url,
+                                  seats_known=seats is not None)
+        for row in to_notify_seats:
+            self.health.day_notifications += 1
+            await notify_seats(self.bot, row, settings.event_url)

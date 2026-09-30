@@ -1,93 +1,75 @@
 """
-Точка входа приложения
-Запуск Telegram-бота и системы мониторинга
+Точка входа: Telegram-бот + мониторинг Мосбилета
 """
 
 import asyncio
 import logging
+import time
+from logging.handlers import RotatingFileHandler
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+
 from config.settings import settings
 from database import init_db, close_db
 from bot import router
+from bot.handlers import MONITOR
 from utils.scheduler import MonitorScheduler
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+
+def setup_logging():
+    """Лог в bot.log (ротация: 5 файлов по 5 МБ) и в stdout (журнал systemd). Время — московское."""
+    fmt = logging.Formatter('%(asctime)s MSK - %(name)s - %(levelname)s - %(message)s')
+    fmt.converter = lambda secs: time.gmtime(secs + 3 * 3600)
+    file_handler = RotatingFileHandler('bot.log', maxBytes=5 * 1024 * 1024, backupCount=5, encoding='utf-8')
+    file_handler.setFormatter(fmt)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
+    # служебные сообщения aiogram о каждом апдейте не нужны
+    logging.getLogger('aiogram.event').setLevel(logging.WARNING)
+
 
 logger = logging.getLogger(__name__)
 
 
 async def main():
-    """Главная функция запуска"""
-
-    # Проверка настроек
     try:
         settings.validate()
     except ValueError as e:
-        logger.error(f"✗ Ошибка конфигурации: {e}")
-        logger.error("   Проверьте файл .env и заполните обязательные параметры")
+        logger.error(f"✗ Ошибка конфигурации: {e}. Проверьте файл .env")
         return
 
     logger.info("=" * 60)
-    logger.info("🎭 Запуск бота мониторинга билетов 'Жирная Люба'")
+    logger.info("🎭 Запуск бота мониторинга «Жирная Люба» (Мосбилет)")
+    logger.info(f"   Событие: {settings.event_url}, интервал {settings.BASE_INTERVAL} с")
     logger.info("=" * 60)
 
-    # Инициализация базы данных
-    logger.info("📊 Инициализация базы данных...")
     await init_db()
 
-    # Создание бота и диспетчера
-    bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+    bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
     dp = Dispatcher()
     dp.include_router(router)
 
-    logger.info("✓ Telegram-бот инициализирован")
-
-    # Запуск системы мониторинга
     scheduler = MonitorScheduler()
-    scheduler.add_monitors()
-
-    # Создаем задачу для мониторинга
-    monitoring_task = asyncio.create_task(scheduler.start_all())
-
-    logger.info("=" * 60)
-    logger.info("✅ Система запущена и работает")
-    logger.info(f"   Bot: @{(await bot.get_me()).username}")
-    logger.info(f"   Мониторов: {len(scheduler.monitors)}")
-    logger.info("=" * 60)
+    MONITOR['mosbilet'] = scheduler.add_monitors(bot=bot)
+    await scheduler.start_all()
+    logger.info(f"✅ Бот @{(await bot.get_me()).username} запущен")
 
     try:
-        # Запуск polling
+        # aiogram сам корректно завершает polling по SIGTERM (systemctl stop/restart)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    except KeyboardInterrupt:
-        logger.info("⏹ Получен сигнал остановки...")
     finally:
-        # Корректное завершение
         logger.info("🔄 Завершение работы...")
-
-        # Остановка мониторинга
         await scheduler.stop_all()
-
-        # Закрытие бота
         await bot.session.close()
-
-        # Закрытие БД
         await close_db()
-
         logger.info("✅ Бот остановлен")
 
 
 if __name__ == '__main__':
+    setup_logging()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("👋 До свидания!")
+        pass
