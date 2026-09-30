@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 class TelegramChannelMonitor(BaseMonitor):
     """Монитор Telegram-канала"""
 
-    def __init__(self):
-        super().__init__(source_name='telegram')
+    def __init__(self, bot=None):
+        super().__init__(source_name='telegram', bot=bot)
         self.channel = settings.TG_CHANNEL
         self.client = None  # Telethon client будет инициализирован позже
         self.last_message_id = 0

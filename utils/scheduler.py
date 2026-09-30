@@ -12,6 +12,7 @@ from monitors import (
     TelegramChannelMonitor,
     VKGroupMonitor
 )
+from config.settings import settings
 import logging
 
 logger = logging.getLogger(__name__)
@@ -24,15 +25,22 @@ class MonitorScheduler:
         self.monitors = []
         self.tasks = []
 
-    def add_monitors(self):
+    def add_monitors(self, bot=None):
         """Добавить все мониторы"""
-        self.monitors = [
-            ShalomSiteMonitor(),
-            AfishaMonitor(),
-            MosbiletMonitor(),
-            TelegramChannelMonitor(),
-            VKGroupMonitor()
-        ]
+        available = {
+            'mosbilet': MosbiletMonitor,
+            'shalom_site': ShalomSiteMonitor,
+            'afisha': AfishaMonitor,
+            'telegram': TelegramChannelMonitor,
+            'vk': VKGroupMonitor,
+        }
+        self.monitors = []
+        for name in settings.ENABLED_MONITORS:
+            cls = available.get(name)
+            if cls is None:
+                logger.warning(f"Неизвестный монитор в ENABLED_MONITORS: {name}")
+                continue
+            self.monitors.append(cls(bot=bot))
         logger.info(f"✓ Добавлено мониторов: {len(self.monitors)}")
 
     async def start_all(self):

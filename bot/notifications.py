@@ -37,23 +37,29 @@ async def broadcast(
         result = await session.execute(
             select(User).where(User.is_subscribed == True)
         )
-        users = result.scalars().all()
+        users = list(result.scalars().all())
+
+        # Администратор получает уведомления всегда, даже если не делал /start
+        from config.settings import settings
+        chat_ids = [u.chat_id for u in users]
+        if settings.ADMIN_CHAT_ID and settings.ADMIN_CHAT_ID not in chat_ids:
+            chat_ids.append(settings.ADMIN_CHAT_ID)
 
         success_count = 0
         failed_users = []
 
-        for user in users:
+        for chat_id in chat_ids:
             try:
                 await bot.send_message(
-                    chat_id=user.chat_id,
+                    chat_id=chat_id,
                     text=message,
                     parse_mode=parse_mode
                 )
                 success_count += 1
-                logger.info(f"✓ Уведомление отправлено: {user.chat_id}")
+                logger.info(f"✓ Уведомление отправлено: {chat_id}")
             except Exception as e:
-                failed_users.append(user.chat_id)
-                logger.error(f"✗ Ошибка отправки {user.chat_id}: {e}")
+                failed_users.append(chat_id)
+                logger.error(f"✗ Ошибка отправки {chat_id}: {e}")
 
         # Логируем результат рассылки
         log_entry = NotificationLog(
@@ -68,7 +74,7 @@ async def broadcast(
         session.add(log_entry)
         await session.commit()
 
-        logger.info(f"📨 Рассылка завершена: {success_count}/{len(users)} успешно")
+        logger.info(f"📨 Рассылка завершена: {success_count}/{len(chat_ids)} успешно")
         return success_count
 
 
@@ -91,13 +97,13 @@ async def notify_tickets_found(
         Количество отправленных уведомлений
     """
     message_lines = [
-        "🚨 **СТАРТ ПРОДАЖ!** 🚨",
+        "🚨 *СТАРТ ПРОДАЖ!* 🚨",
         "",
-        "**Спектакль:** Жирная Люба",
-        f"**Дата:** {event_date}",
-        f"**Площадка:** {venue}",
+        "*Спектакль:* Жирная Люба",
+        f"*Дата:* {event_date}",
+        f"*Площадка:* {venue}",
         "",
-        "**Ссылки на покупку (КЛИКАЙ БЫСТРО):**"
+        "*Ссылки на покупку (КЛИКАЙ БЫСТРО):*"
     ]
 
     # Добавляем ссылки из разных источников
@@ -148,16 +154,16 @@ async def notify_returned_tickets(
     source_name = source_names.get(source, source)
 
     message = f"""
-🔄 **ОСВОБОДИЛИСЬ БИЛЕТЫ!**
+🔄 *ОСВОБОДИЛИСЬ БИЛЕТЫ!*
 
-**Спектакль:** Жирная Люба
-**Дата:** {event_date}
-**Площадка:** {venue}
+*Спектакль:* Жирная Люба
+*Дата:* {event_date}
+*Площадка:* {venue}
 
 Кто-то не оплатил бронь, билеты вернулись в продажу!
 
-**Источник:** {source_name}
-**Ссылка:** {url}
+*Источник:* {source_name}
+*Ссылка:* {url}
     """.strip()
 
     return await broadcast(
@@ -193,13 +199,13 @@ async def notify_announcement(
     source_name = source_names.get(source, source)
 
     message = f"""
-📢 **АНОНС ОТ ТЕАТРА**
+📢 *АНОНС ОТ ТЕАТРА*
 
-**Источник:** {source_name}
+*Источник:* {source_name}
 
 {announcement_text}
 
-**Оригинал:** {source_url}
+*Оригинал:* {source_url}
     """.strip()
 
     return await broadcast(
@@ -228,10 +234,27 @@ async def notify_admin(
     try:
         await bot.send_message(
             chat_id=admin_chat_id,
-            text=f"🔧 **ADMIN NOTIFICATION**\n\n{message}",
+            text=f"🔧 *ADMIN NOTIFICATION*\n\n{message}",
             parse_mode="Markdown"
         )
         return True
     except Exception as e:
         logger.error(f"✗ Ошибка отправки админу: {e}")
         return False
+
+
+async def notify_seats_available(bot: Bot, event: dict) -> int:
+    """Уведомление: на Мосбилете появились свободные места"""
+    head = "🔄 На Мосбилете снова есть билеты" if event.get('returned') else "🎫 На Мосбилете есть билеты"
+    lines = [
+        head,
+        "",
+        "Спектакль: Жирная Люба",
+        f"Даты: {event.get('event_date') or 'уточняются'}",
+    ]
+    if event.get('price_from'):
+        lines.append(f"Цена: от {event['price_from']} ₽")
+    lines += ["", event['url']]
+    return await broadcast(bot=bot, message="\n".join(lines),
+                           notification_type="returned_tickets" if event.get('returned') else "new_sale",
+                           parse_mode=None)

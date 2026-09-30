@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 class VKGroupMonitor(BaseMonitor):
     """Монитор VK группы"""
 
-    def __init__(self):
-        super().__init__(source_name='vk')
+    def __init__(self, bot=None):
+        super().__init__(source_name='vk', bot=bot)
         self.group_id = settings.VK_GROUP_ID
         self.last_post_id = 0
 

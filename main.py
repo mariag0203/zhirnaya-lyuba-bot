@@ -54,7 +54,7 @@ async def main():
 
     # Запуск системы мониторинга
     scheduler = MonitorScheduler()
-    scheduler.add_monitors()
+    scheduler.add_monitors(bot=bot)
 
     # Создаем задачу для мониторинга
     monitoring_task = asyncio.create_task(scheduler.start_all())

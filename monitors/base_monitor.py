@@ -27,12 +27,14 @@ class BaseMonitor(ABC):
     - parse_response(): парсинг ответа от источника
     """
 
-    def __init__(self, source_name: str):
+    def __init__(self, source_name: str, bot=None):
         """
         Args:
             source_name: Имя источника (shalom_site, afisha, mosbilet, etc.)
+            bot: Объект aiogram Bot для отправки уведомлений
         """
         self.source_name = source_name
+        self.bot = bot
         self.mode = 'normal'  # normal или enhanced
         self.enhanced_until: Optional[datetime] = None
         self.error_count = 0
@@ -59,32 +61,11 @@ class BaseMonitor(ABC):
 
     def get_interval(self) -> int:
         """Получить текущий интервал проверки в секундах"""
-        if self.mode == 'enhanced':
-            return settings.ENHANCED_INTERVAL
-        return settings.BASE_INTERVAL
+        return max(settings.MIN_INTERVAL, settings.BASE_INTERVAL)
 
     async def switch_to_enhanced_mode(self, duration: int = None):
-        """
-        Переключить в усиленный режим мониторинга
-
-        Args:
-            duration: Длительность усиленного режима в секундах
-        """
-        if duration is None:
-            duration = settings.ENHANCED_DURATION
-
-        self.mode = 'enhanced'
-        self.enhanced_until = datetime.utcnow() + timedelta(seconds=duration)
-
-        async with async_session_maker() as session:
-            await session.execute(
-                update(MonitoringState)
-                .where(MonitoringState.source == self.source_name)
-                .values(mode='enhanced')
-            )
-            await session.commit()
-
-        logger.info(f"🔥 {self.source_name}: переход в усиленный режим ({duration}с)")
+        """Усиленный режим отключён: интервал не бывает меньше MIN_INTERVAL."""
+        return
 
     async def check_mode(self):
         """Проверить, не истек ли усиленный режим"""
@@ -114,12 +95,7 @@ class BaseMonitor(ABC):
         Returns:
             URL прокси или None
         """
-        if not settings.PROXY_LIST:
-            return None
-
-        proxy = settings.PROXY_LIST[self.current_proxy_index]
-        self.current_proxy_index = (self.current_proxy_index + 1) % len(settings.PROXY_LIST)
-        return proxy
+        return None  # прокси не используются
 
     async def make_request(
         self,
@@ -127,7 +103,7 @@ class BaseMonitor(ABC):
         method: str = 'GET',
         headers: Optional[Dict] = None,
         **kwargs
-    ) -> Optional[aiohttp.ClientResponse]:
+    ) -> Optional[str]:
         """
         Выполнить HTTP запрос с обработкой ошибок и прокси
 
@@ -138,20 +114,35 @@ class BaseMonitor(ABC):
             **kwargs: Дополнительные параметры для aiohttp
 
         Returns:
-            Response объект или None при ошибке
+            HTML-текст страницы или None при ошибке
         """
         proxy = self.get_proxy()
 
         default_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/120.0.0.0 Safari/537.36'
+            ),
+            'Accept': (
+                'text/html,application/xhtml+xml,application/xml;'
+                'q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
+            ),
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
         }
 
         if headers:
             default_headers.update(headers)
 
-        timeout = aiohttp.ClientTimeout(total=10)
+        timeout = aiohttp.ClientTimeout(total=30)
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -164,7 +155,8 @@ class BaseMonitor(ABC):
                 ) as response:
                     response.raise_for_status()
                     self.error_count = 0  # Сброс счетчика ошибок при успехе
-                    return response
+                    # Читаем текст ВНУТРИ контекста, пока соединение открыто
+                    return await response.text()
 
         except asyncio.TimeoutError:
             self.error_count += 1
@@ -208,6 +200,24 @@ class BaseMonitor(ABC):
             )
             await session.commit()
 
+    async def _send_notifications(self, events: List[Dict[str, Any]]):
+        """
+        Отправить уведомления пользователям о найденных событиях
+
+        Args:
+            events: Список новых событий из check_source()
+        """
+        if not self.bot:
+            logger.debug(f"{self.source_name}: bot не установлен, уведомления пропущены")
+            return
+
+        from bot.notifications import notify_seats_available
+        for event in events:
+            try:
+                await notify_seats_available(self.bot, event)
+            except Exception as e:
+                logger.error(f"✗ {self.source_name}: ошибка отправки уведомления: {e}")
+
     @abstractmethod
     async def check_source(self) -> List[Dict[str, Any]]:
         """
@@ -228,29 +238,51 @@ class BaseMonitor(ABC):
 
         logger.info(f"🚀 Запуск монитора: {self.source_name}")
 
+        consecutive_failures = 0
+        alerted = False
+
         while True:
             try:
-                # Проверка режима (не истек ли enhanced)
-                await self.check_mode()
-
-                # Основная проверка
                 events = await self.check_source()
 
                 if events:
                     logger.info(f"🎫 {self.source_name}: найдено событий: {len(events)}")
+                    await self._send_notifications(events)
 
-                # Обновление состояния
                 await self.update_state(success=True)
 
-                # Небольшая случайная задержка (джиттер)
+                if alerted:
+                    await self._alert_admin(f"✅ {self.source_name}: проверки снова проходят успешно")
+                consecutive_failures, alerted = 0, False
+
                 interval = self.get_interval()
-                jitter = random.uniform(-0.5, 0.5)
-                await asyncio.sleep(max(1, interval + jitter))
+                await asyncio.sleep(interval + random.uniform(0, 5))
 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error(f"✗ {self.source_name}: критическая ошибка в цикле: {e}")
-                await self.update_state(success=False, error_text=str(e))
+                consecutive_failures += 1
+                logger.error(f"✗ {self.source_name}: ошибка проверки ({consecutive_failures} подряд): {e}")
+                try:
+                    await self.update_state(success=False, error_text=str(e))
+                except Exception:
+                    pass
 
-                # Exponential backoff при ошибках
-                backoff = min(60, 5 * (2 ** min(self.error_count, 5)))
+                if consecutive_failures >= 5 and not alerted:
+                    await self._alert_admin(
+                        f"⚠️ {self.source_name}: {consecutive_failures} неудачных проверок подряд.\n"
+                        f"Последняя ошибка: {e}"
+                    )
+                    alerted = True
+
+                # При ошибках ждём дольше обычного: от интервала до 15 минут
+                backoff = min(900, self.get_interval() * (2 ** min(consecutive_failures - 1, 4)))
                 await asyncio.sleep(backoff)
+
+    async def _alert_admin(self, text: str):
+        if not self.bot or not settings.ADMIN_CHAT_ID:
+            return
+        try:
+            await self.bot.send_message(settings.ADMIN_CHAT_ID, text, parse_mode=None)
+        except Exception as e:
+            logger.error(f"✗ не удалось отправить сообщение администратору: {e}")

@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 class ShalomSiteMonitor(BaseMonitor):
     """Монитор сайта театра Шалом"""
 
-    def __init__(self):
-        super().__init__(source_name='shalom_site')
+    def __init__(self, bot=None):
+        super().__init__(source_name='shalom_site', bot=bot)
         self.main_url = settings.SHALOM_SITE_URL
         self.afisha_url = settings.SHALOM_AFISHA_URL
         self.known_events = set()  # Хранение известных событий (URL)
@@ -47,13 +47,12 @@ class ShalomSiteMonitor(BaseMonitor):
         Returns:
             Список найденных событий
         """
-        response = await self.make_request(url)
+        html = await self.make_request(url)
 
-        if not response:
+        if not html:
             return []
 
         try:
-            html = await response.text()
             soup = BeautifulSoup(html, 'lxml')
 
             events = self._parse_afisha(soup, url)

@@ -17,20 +17,19 @@ logger = logging.getLogger(__name__)
 class AfishaMonitor(BaseMonitor):
     """Монитор Afisha.ru"""
 
-    def __init__(self):
-        super().__init__(source_name='afisha')
+    def __init__(self, bot=None):
+        super().__init__(source_name='afisha', bot=bot)
         self.performance_url = settings.AFISHA_PERFORMANCE_URL
         self.known_events = set()
 
     async def check_source(self) -> List[Dict[str, Any]]:
         """Проверка страницы спектакля на Afisha"""
-        response = await self.make_request(self.performance_url)
+        html = await self.make_request(self.performance_url)
 
-        if not response:
+        if not html:
             return []
 
         try:
-            html = await response.text()
             soup = BeautifulSoup(html, 'lxml')
 
             events = self._parse_schedule(soup)

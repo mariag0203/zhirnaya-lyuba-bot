@@ -21,9 +21,17 @@ class Settings:
     DATABASE_URL: str = os.getenv('DATABASE_URL', 'sqlite+aiosqlite:///bot.db')
 
     # Monitoring intervals (в секундах)
-    BASE_INTERVAL: int = int(os.getenv('BASE_INTERVAL', '60'))  # Обычный режим: 60 сек
-    ENHANCED_INTERVAL: int = int(os.getenv('ENHANCED_INTERVAL', '2'))  # Усиленный: 2 сек
-    ENHANCED_DURATION: int = int(os.getenv('ENHANCED_DURATION', '900'))  # Длительность усиленного режима: 15 мин
+    # Нижняя граница интервала жёстко 60 сек — чаще опрашивать сайт не будем,
+    # что бы ни стояло в .env. Усиленного режима больше нет.
+    MIN_INTERVAL: int = 60
+    BASE_INTERVAL: int = max(MIN_INTERVAL, int(os.getenv('BASE_INTERVAL', '90')))
+
+    # Какие мониторы запускать (через запятую). По умолчанию только Мосбилет.
+    ENABLED_MONITORS: List[str] = [m.strip() for m in os.getenv('ENABLED_MONITORS', 'mosbilet').split(',') if m.strip()]
+
+    # Мосбилет: точное название спектакля и (необязательно) дополнительные ID событий
+    MOSBILET_TITLE: str = os.getenv('MOSBILET_TITLE', 'Жирная Люба')
+    MOSBILET_EVENT_IDS: List[str] = [i.strip() for i in os.getenv('MOSBILET_EVENT_IDS', '').split(',') if i.strip()]
 
     # Keywords для поиска
     KEYWORDS_REQUIRED: List[str] = os.getenv('KEYWORDS_REQUIRED', 'Жирная Люба').split(',')
@@ -39,8 +47,8 @@ class Settings:
     TG_PHONE: Optional[str] = os.getenv('TG_PHONE')
     TG_CHANNEL: str = 'shalomteatr'
 
-    # Proxy
-    PROXY_LIST: List[str] = [p.strip() for p in os.getenv('PROXY_LIST', '').split(',') if p.strip()]
+    # Прокси не используются: запросы идут напрямую с IP сервера.
+    PROXY_LIST: List[str] = []
 
     # URLs для мониторинга
     SHALOM_SITE_URL: str = 'https://shalom-theatre.ru/'
@@ -64,11 +72,8 @@ class Settings:
         return f"""
 🔧 Текущие настройки:
 ├─ База: {cls.DATABASE_URL}
-├─ Интервал (норм): {cls.BASE_INTERVAL} сек
-├─ Интервал (усил): {cls.ENHANCED_INTERVAL} сек
-├─ Длительность усиленного режима: {cls.ENHANCED_DURATION} сек
-├─ Прокси: {'Да (' + str(len(cls.PROXY_LIST)) + ')' if cls.PROXY_LIST else 'Нет'}
-└─ VK токен: {'✓' if cls.VK_TOKEN else '✗'}
+├─ Интервал: {cls.BASE_INTERVAL} сек
+└─ Мониторы: {', '.join(cls.ENABLED_MONITORS)}
         """.strip()
 
 # Создание глобального экземпляра настроек

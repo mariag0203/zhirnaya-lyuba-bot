@@ -5,3 +5,6 @@ __pycache__/
 *.log
 venv/
 .idea/
+
+proxys*.txt
+_backup_*/
