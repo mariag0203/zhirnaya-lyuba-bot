@@ -1,16 +1,17 @@
 """
-Модели базы данных для хранения пользователей, событий и уведомлений
+Модели базы данных
 """
 
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, BigInteger
-from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
+
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, BigInteger
+from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
 
 
 class User(Base):
-    """Пользователи бота"""
+    """Подписчики бота"""
     __tablename__ = 'users'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -21,56 +22,52 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    def __repr__(self):
-        return f"<User(chat_id={self.chat_id}, username={self.username})>"
 
+class Show(Base):
+    """
+    Отдельный показ спектакля (дата и время).
 
-class TicketEvent(Base):
-    """События (спектакли) с билетами"""
-    __tablename__ = 'ticket_events'
+    На Мосбилете у спектакля одна страница /event/381336257/, а показы — это
+    «occurrences» этого события. Своих страниц у показов нет; в билетной системе
+    у показа есть performance_id, но он виден, только пока на показ есть места.
+    Поэтому показ опознаётся по дате и времени начала.
+    """
+    __tablename__ = 'shows'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    event_date = Column(DateTime, nullable=True)       # Дата спектакля
-    venue = Column(String(500), nullable=True)         # Площадка
-    source = Column(String(100), nullable=False)       # shalom_site, afisha, mosbilet
-    url = Column(Text, nullable=False)                 # Прямая ссылка на покупку
-    status = Column(String(50), default='available')   # available, sold_out, monitoring
-    notified = Column(Boolean, default=False)          # Отправлено ли уведомление
-    discovered_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    def __repr__(self):
-        return f"<TicketEvent(date={self.event_date}, source={self.source}, status={self.status})>"
+    event_id = Column(BigInteger, nullable=False, index=True)       # ID события на bilet.mos.ru
+    starts_at = Column(DateTime, nullable=False, index=True)        # время Москвы, как на сайте
+    performance_id = Column(BigInteger, nullable=True)              # ID в билетной системе, если был виден
+    free_seats = Column(Integer, default=0)                         # свободные места при последней проверке
+    min_price = Column(Integer, nullable=True)                      # минимальная цена, ₽
+    is_listed = Column(Boolean, default=True)                       # есть ли показ в расписании сейчас
+    first_seen_at = Column(DateTime, default=datetime.utcnow)       # UTC
+    last_seen_at = Column(DateTime, default=datetime.utcnow)        # UTC
+    seats_changed_at = Column(DateTime, nullable=True)              # UTC
+    last_seats_notified_at = Column(DateTime, nullable=True)        # UTC
 
 
 class NotificationLog(Base):
-    """Лог отправленных уведомлений"""
+    """Лог рассылок"""
     __tablename__ = 'notification_logs'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    event_id = Column(Integer, nullable=True)              # ID события из TicketEvent
-    notification_type = Column(String(50), nullable=False) # new_sale, returned_tickets, announcement
-    message = Column(Text, nullable=False)                 # Текст отправленного сообщения
-    recipients_count = Column(Integer, default=0)          # Сколько пользователей получили
+    event_id = Column(Integer, nullable=True)              # здесь: id записи Show
+    notification_type = Column(String(50), nullable=False) # new_show, seats, admin
+    message = Column(Text, nullable=False)
+    recipients_count = Column(Integer, default=0)
     sent_at = Column(DateTime, default=datetime.utcnow)
     success = Column(Boolean, default=True)
-    error_text = Column(Text, nullable=True)               # Текст ошибки, если success=False
-
-    def __repr__(self):
-        return f"<NotificationLog(type={self.notification_type}, sent_at={self.sent_at}, success={self.success})>"
+    error_text = Column(Text, nullable=True)
 
 
 class MonitoringState(Base):
-    """Состояние мониторинга (для отслеживания режимов)"""
+    """Время последних проверок (для /status после перезапуска)"""
     __tablename__ = 'monitoring_state'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    source = Column(String(100), unique=True, nullable=False)  # shalom_site, afisha, etc.
+    source = Column(String(100), unique=True, nullable=False)
     last_check = Column(DateTime, default=datetime.utcnow)
     last_success = Column(DateTime, nullable=True)
-    mode = Column(String(20), default='normal')  # normal, enhanced
     error_count = Column(Integer, default=0)
     last_error = Column(Text, nullable=True)
-
-    def __repr__(self):
-        return f"<MonitoringState(source={self.source}, mode={self.mode})>"

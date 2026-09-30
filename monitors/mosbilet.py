@@ -1,147 +1,265 @@
 """
-Монитор Мосбилет (bilet.mos.ru)
+Монитор Мосбилета (bilet.mos.ru) для одного спектакля.
 
-Использует тот же публичный JSON-эндпоинт, которым пользуется сам сайт:
-  /api/newsfeed/v4/frontend/json/ru/afisha
-Один GET за цикл: фильтр по точному названию спектакля находит все
-актуальные события (в т.ч. новые ID), а поле ebs_has_available_seats
-показывает, есть ли свободные места.
+Источники (те же, что использует сама страница https://bilet.mos.ru/event/<ID>/):
+  1. /api/newsfeed/v4/frontend/json/ru/afisha/<ID>
+       карточка события: ebs_id и agent_uid в билетной системе, общий флаг
+       «есть места», дата открытия продаж
+  2. /api/newsfeed/v4/frontend/json/ru/afisha/<ID>/occurrences
+       ВСЕ показы с датой и временем, в том числе распроданные. По этому списку бот
+       узнаёт о новых показах (26.09 внеплановый показ на 27.09 появился именно здесь).
+  3. https://tickets-external.mos.ru/api/widget/v2/event/<ebs_id>/performances
+       расписание из билетной системы: по каждому показу, на который ЕСТЬ места,
+       число свободных мест и минимальная цена в рублях. Распроданные показы сюда
+       не попадают, поэтому их нет — значит 0 мест.
 
-Уведомление отправляется при переходе «мест нет» -> «места есть»
-(и при первом обнаружении события, если места уже есть).
-Состояние хранится в БД, поэтому перезапуск не вызывает повторных уведомлений.
+Три GET-запроса за цикл, цикл раз в BASE_INTERVAL секунд (не чаще раза в минуту).
 """
 
-import json
 import logging
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select
 
 from config.settings import settings
 from database.db import async_session_maker
-from database.models import TicketEvent
-from monitors.base_monitor import BaseMonitor
+from database.models import Show
+from monitors.base_monitor import BaseMonitor, RequestError
+from utils.timefmt import now_msk, parse_site_dt, fmt_show
 
 logger = logging.getLogger(__name__)
 
-API_PATH = '/api/newsfeed/v4/frontend/json/ru/afisha'
-FIELDS = 'id,title,date_from,date_to,ebs_has_available_seats,ebs_price_from,ebs_price_to'
+NEWSFEED = '/api/newsfeed/v4/frontend/json/ru/afisha'
+PERF_DAYS_PER_PAGE = 10
+
+
+class ParseError(Exception):
+    """Ответ пришёл, но в нём не то, что мы ожидаем (похоже, сайт поменялся)."""
+
+
+@dataclass
+class SeatInfo:
+    performance_id: Optional[int]
+    free_seats: int
+    min_price: Optional[int]
 
 
 class MosbiletMonitor(BaseMonitor):
-    """Монитор Мосбилет через JSON API афиши mos.ru"""
-
     def __init__(self, bot=None):
         super().__init__(source_name='mosbilet', bot=bot)
+        self.event_id = settings.MOSBILET_EVENT_ID
         self.base_url = settings.MOSBILET_BASE_URL
-        self.title = settings.MOSBILET_TITLE
-        self.extra_ids = settings.MOSBILET_EVENT_IDS
+        self.tickets_url = settings.TICKETS_BASE_URL
+        self.empty_alerted = False
+        self.opening_date: Optional[datetime] = None
+        self.event_title: str = 'Жирная Люба'
 
-    def _build_url(self, flt: Dict[str, Any]) -> str:
-        from urllib.parse import urlencode
-        query = urlencode({
-            'fields': FIELDS,
-            'filter': json.dumps(flt, ensure_ascii=False),
-            'per-page': 50,
-        })
-        return f"{self.base_url}{API_PATH}?{query}"
+    # ---------- получение данных ----------
 
-    async def fetch_items(self) -> Optional[List[Dict[str, Any]]]:
-        """Получить события: по названию + явно заданные ID. None при ошибке."""
-        flt: Dict[str, Any] = {'title': self.title}
-        text = await self.make_request(
-            self._build_url(flt),
-            headers={'Accept': 'application/json'},
+    async def fetch_event(self) -> Dict[str, Any]:
+        data = await self.get_json(f"{self.base_url}{NEWSFEED}/{self.event_id}")
+        if not isinstance(data, dict) or data.get('id') != self.event_id:
+            raise ParseError('карточка события: нет поля id или id другой')
+        if not data.get('ebs_id') or not data.get('ebs_agent_uid'):
+            raise ParseError('карточка события: нет ebs_id / ebs_agent_uid')
+        return data
+
+    async def fetch_occurrences(self) -> List[datetime]:
+        data = await self.get_json(
+            f"{self.base_url}{NEWSFEED}/{self.event_id}/occurrences",
+            params={'per-page': 50},
         )
-        if text is None:
-            return None
-        items = self.parse_items(text)
-        if items is None:
-            return None
+        items = data.get('items') if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise ParseError('список показов: нет поля items')
+        result = []
+        for it in items:
+            dt = parse_site_dt(it.get('date_from', '')) if isinstance(it, dict) else None
+            if dt is None:
+                raise ParseError(f'список показов: не разобрать дату в {str(it)[:100]}')
+            result.append(dt)
+        return result
 
-        # Явно заданные ID (на случай, если название на сайте отличается) —
-        # отдельным запросом, т.к. фильтр API не поддерживает OR.
-        if self.extra_ids:
-            text2 = await self.make_request(
-                self._build_url({'id': [int(i) for i in self.extra_ids]}),
-                headers={'Accept': 'application/json'},
+    async def fetch_seats(self, ebs_id: int, agent_uid: str) -> Dict[datetime, SeatInfo]:
+        """Места по показам. Распроданных показов в ответе нет."""
+        seats: Dict[datetime, SeatInfo] = {}
+        date_from = now_msk().date()
+        for _ in range(5):  # страницы по PERF_DAYS_PER_PAGE дней с показами
+            data = await self.get_json(
+                f"{self.tickets_url}/api/widget/v2/event/{ebs_id}/performances",
+                params={
+                    'date_from': date_from.isoformat(),
+                    'date_to': '',
+                    'performances_limit_by_days': PERF_DAYS_PER_PAGE,
+                    'agent_id': agent_uid,
+                },
             )
-            extra = self.parse_items(text2) if text2 else None
-            if extra:
-                known = {it['id'] for it in items}
-                items.extend(it for it in extra if it['id'] not in known)
-        return items
-
-    def parse_items(self, text: str) -> Optional[List[Dict[str, Any]]]:
-        try:
-            data = json.loads(text)
-            items = data.get('items')
-            if not isinstance(items, list):
-                raise ValueError('нет поля items')
-            return [it for it in items if isinstance(it, dict) and 'id' in it]
-        except Exception as e:
-            logger.error(f"✗ {self.source_name}: не удалось разобрать ответ API: {e}")
-            self.error_count += 1
-            return None
-
-    @staticmethod
-    def _fmt_dates(item: Dict[str, Any]) -> str:
-        def d(s):
-            try:
-                return datetime.strptime(s, '%Y-%m-%d %H:%M:%S').strftime('%d.%m.%Y %H:%M')
-            except Exception:
-                return s or '?'
-        a, b = item.get('date_from'), item.get('date_to')
-        if a and b and a[:10] != b[:10]:
-            return f"{d(a)} — {d(b)}"
-        return d(a)
-
-    async def check_source(self) -> List[Dict[str, Any]]:
-        items = await self.fetch_items()
-        if items is None:
-            raise RuntimeError('запрос к API Мосбилета не удался')
-
-        new_events: List[Dict[str, Any]] = []
-        async with async_session_maker() as session:
-            for item in items:
-                url = f"{self.base_url}/event/{item['id']}/"
-                available = bool(item.get('ebs_has_available_seats'))
-                status = 'available' if available else 'sold_out'
-
-                res = await session.execute(
-                    select(TicketEvent).where(
-                        TicketEvent.source == self.source_name,
-                        TicketEvent.url == url,
+            if not isinstance(data, list):
+                raise ParseError('билетная система: ожидался список дней')
+            for day in data:
+                for p in (day or {}).get('performances') or []:
+                    dt = parse_site_dt(p.get('start_datetime', ''))
+                    free = p.get('free_seats_count')
+                    if dt is None or not isinstance(free, int):
+                        raise ParseError(f'билетная система: неожиданный показ {str(p)[:120]}')
+                    price = p.get('min_performance_price')
+                    seats[dt] = SeatInfo(
+                        performance_id=p.get('id'),
+                        free_seats=max(0, free),
+                        min_price=int(price) if isinstance(price, (int, float)) else None,
                     )
-                )
-                row = res.scalar_one_or_none()
-                prev = row.status if row else None
+            if len(data) < PERF_DAYS_PER_PAGE:
+                break
+            last = parse_site_dt(data[-1].get('date', '') + ' 00:00')
+            if not last:
+                break
+            date_from = (last + timedelta(days=1)).date()
+        return seats
 
+    # ---------- одна проверка ----------
+
+    async def check(self) -> None:
+        try:
+            event = await self.fetch_event()
+            occurrences = await self.fetch_occurrences()
+        except ParseError as e:
+            await self._register_empty(f"ответ сайта не разобран: {e}")
+            raise
+
+        self.event_title = event.get('title') or self.event_title
+        self.opening_date = parse_site_dt(event.get('ebs_opening_date') or '')
+        flag = event.get('ebs_has_available_seats')
+
+        try:
+            seats = await self.fetch_seats(int(event['ebs_id']), str(event['ebs_agent_uid']))
+            self.health.seats_source_ok = True
+        except (RequestError, ParseError) as e:
+            # Без билетной системы новые показы всё равно видны; места — нет.
+            logger.warning(f"{self.source_name}: места по показам не получены: {e}")
+            self.health.seats_source_ok = False
+            self.health.last_error = f"места по показам не получены: {e}"
+            seats = None
+
+        now = now_msk().replace(tzinfo=None)
+        shows = {dt for dt in occurrences if dt > now}
+        if seats:
+            shows |= {dt for dt in seats if dt > now}
+
+        if not any(dt > now for dt in occurrences):
+            # Даже если билетная система что-то вернула: пустой список показов
+            # на странице события — признак, что разбор сломался
+            await self._register_empty('в расписании на странице спектакля не найдено ни одного будущего показа')
+        else:
+            await self._register_found()
+
+        await self.sync_shows(sorted(shows), seats)
+
+        total = sum(s.free_seats for s in (seats or {}).values())
+        self.health.shows_found = len(shows)
+        self.health.free_seats_total = total
+        summary = ', '.join(
+            f"{d:%d.%m %H:%M}={seats[d].free_seats if seats and d in seats else (0 if seats is not None else '?')}"
+            for d in sorted(shows)
+        ) or 'нет'
+        logger.info(f"{self.source_name}: показов {len(shows)}, места: {summary}; флаг афиши: {flag}")
+        if seats is not None and bool(flag) != (total > 0):
+            logger.info(f"{self.source_name}: флаг афиши ({flag}) расходится с билетной системой ({total} мест)")
+
+    async def _register_empty(self, reason: str):
+        h = self.health
+        h.consecutive_empty += 1
+        if h.consecutive_empty >= settings.PARSE_ALERT_AFTER and not self.empty_alerted:
+            self.empty_alerted = True
+            await self.alert_admin(
+                f"⚠️ Мосбилет: {h.consecutive_empty} проверок подряд — {reason}.\n"
+                "Скорее всего, сайт поменял вёрстку или API, и бот сейчас ничего не видит. "
+                "Если показы спектакля просто закончились, это тоже объяснение.\n"
+                f"{settings.event_url}"
+            )
+
+    async def _register_found(self):
+        if self.empty_alerted:
+            await self.alert_admin("✅ Мосбилет: показы снова находятся, разбор работает")
+        self.empty_alerted = False
+        self.health.consecutive_empty = 0
+
+    # ---------- сравнение с базой и уведомления ----------
+
+    async def sync_shows(self, shows: List[datetime], seats: Optional[Dict[datetime, SeatInfo]]):
+        from bot.notifications import notify_new_show, notify_seats
+
+        utcnow = datetime.utcnow()
+        cooldown = timedelta(minutes=settings.NOTIFY_COOLDOWN_MIN)
+        to_notify_new: List[Show] = []
+        to_notify_seats: List[Show] = []
+
+        async with async_session_maker() as session:
+            res = await session.execute(select(Show).where(Show.event_id == self.event_id))
+            rows = {r.starts_at: r for r in res.scalars().all()}
+            first_run = not rows
+
+            for dt in shows:
+                info = seats.get(dt) if seats is not None else None
+                row = rows.get(dt)
                 if row is None:
-                    row = TicketEvent(source=self.source_name, url=url,
-                                      venue=item.get('title'), status=status)
+                    row = Show(event_id=self.event_id, starts_at=dt, free_seats=0,
+                               first_seen_at=utcnow, last_seen_at=utcnow, is_listed=True)
                     session.add(row)
-                    logger.info(f"{self.source_name}: новое событие #{item['id']} ({status})")
-                elif prev != status:
-                    logger.info(f"{self.source_name}: #{item['id']} {prev} -> {status}")
-                    row.status = status
+                    rows[dt] = row
+                    logger.info(f"{self.source_name}: новый показ {dt:%d.%m.%Y %H:%M}")
+                    if not first_run:
+                        to_notify_new.append(row)
+                elif not row.is_listed:
+                    row.is_listed = True
+                    logger.info(f"{self.source_name}: показ {dt:%d.%m.%Y %H:%M} снова в расписании")
 
-                if available and prev != 'available':
-                    price = item.get('ebs_price_from')
-                    new_events.append({
-                        'source': self.source_name,
-                        'url': url,
-                        'event_date': self._fmt_dates(item),
-                        'venue': 'Театр «Шалом»',
-                        'price_from': (price // 100) if isinstance(price, int) else None,
-                        'returned': prev == 'sold_out',
-                    })
+                row.last_seen_at = utcnow
+                if seats is None:
+                    continue  # мест не знаем — состояние не трогаем
+
+                prev = row.free_seats or 0
+                now_free = info.free_seats if info else 0
+                if info:
+                    row.performance_id = info.performance_id or row.performance_id
+                    row.min_price = info.min_price
+                if now_free != prev:
+                    row.free_seats = now_free
+                    row.seats_changed_at = utcnow
+                    logger.info(f"{self.source_name}: {dt:%d.%m %H:%M} мест {prev} -> {now_free}")
+
+                if prev == 0 and now_free > 0 and row not in to_notify_new:
+                    recent = row.last_seats_notified_at and utcnow - row.last_seats_notified_at < cooldown
+                    if recent:
+                        logger.info(f"{self.source_name}: {dt:%d.%m %H:%M} — места снова есть, "
+                                    f"но уведомление было меньше {settings.NOTIFY_COOLDOWN_MIN} мин назад")
+                    else:
+                        to_notify_seats.append(row)
+
+            listed = set(shows)
+            for dt, row in rows.items():
+                if row.is_listed and dt not in listed:
+                    row.is_listed = False
+                    logger.info(f"{self.source_name}: показ {dt:%d.%m.%Y %H:%M} пропал из расписания "
+                                f"(прошёл или снят)")
+
+            for row in to_notify_new + to_notify_seats:
+                if (row.free_seats or 0) > 0:
+                    row.last_seats_notified_at = utcnow
             await session.commit()
 
-        logger.info(
-            f"{self.source_name}: проверено событий: {len(items)}, "
-            f"с местами: {sum(1 for i in items if i.get('ebs_has_available_seats'))}"
-        )
-        return new_events
+        if first_run and shows:
+            await self.alert_admin(
+                "Начинаю следить за показами «" + self.event_title + "»:\n" +
+                '\n'.join(f"• {fmt_show(dt)} — мест: "
+                          f"{rows[dt].free_seats if seats is not None else '?'}" for dt in shows)
+            )
+
+        for row in to_notify_new:
+            self.health.day_notifications += 1
+            await notify_new_show(self.bot, row, self.opening_date, settings.event_url,
+                                  seats_known=seats is not None)
+        for row in to_notify_seats:
+            self.health.day_notifications += 1
+            await notify_seats(self.bot, row, settings.event_url)

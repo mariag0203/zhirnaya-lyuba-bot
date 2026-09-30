@@ -1,12 +1,3 @@
 """
-Utils package
-Вспомогательные утилиты
+Вспомогательные модули: timefmt (московское время), scheduler (запуск мониторинга)
 """
-
-from utils.proxy_pool import ProxyPool
-from utils.scheduler import MonitorScheduler
-
-__all__ = [
-    'ProxyPool',
-    'MonitorScheduler'
-]
