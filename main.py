@@ -54,7 +54,13 @@ async def main():
     scheduler = MonitorScheduler()
     MONITOR['mosbilet'] = scheduler.add_monitors(bot=bot)
     await scheduler.start_all()
-    logger.info(f"✅ Бот @{(await bot.get_me()).username} запущен")
+    try:
+        me = await bot.get_me()
+        logger.info(f"✅ Бот @{me.username} запущен")
+    except Exception as e:
+        # Раньше здесь бот падал, если Telegram не ответил за отведённое время
+        # (01.10 — 23 перезапуска подряд). Polling ниже сам повторяет подключение.
+        logger.warning(f"Telegram пока не отвечает ({e}); мониторинг уже работает, подключение повторится")
 
     try:
         # aiogram сам корректно завершает polling по SIGTERM (systemctl stop/restart)

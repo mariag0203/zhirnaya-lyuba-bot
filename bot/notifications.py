@@ -2,12 +2,13 @@
 Рассылка уведомлений подписчикам
 """
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from sqlalchemy import select, update
 
 from config.settings import settings
@@ -16,6 +17,29 @@ from database.models import User, NotificationLog, Show
 from utils.timefmt import fmt_show, now_msk
 
 logger = logging.getLogger(__name__)
+
+
+# Паузы между повторными попытками, если Telegram с сервера не отвечает
+SEND_RETRY_DELAYS = (5, 20, 60)
+
+
+async def send_with_retry(bot: Bot, chat_id: int, text: str) -> None:
+    """Отправить сообщение; при сетевой ошибке Telegram повторить до трёх раз.
+    TelegramForbiddenError (бот заблокирован) пробрасывается сразу."""
+    for attempt, delay in enumerate((*SEND_RETRY_DELAYS, None)):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=None,
+                                   disable_web_page_preview=True)
+            return
+        except TelegramRetryAfter as e:
+            if delay is None:
+                raise
+            await asyncio.sleep(e.retry_after)
+        except TelegramNetworkError as e:
+            if delay is None:
+                raise
+            logger.warning(f"Telegram не ответил ({e}), повтор через {delay} с")
+            await asyncio.sleep(delay)
 
 
 async def broadcast(bot: Optional[Bot], message: str, notification_type: str,
@@ -34,8 +58,7 @@ async def broadcast(bot: Optional[Bot], message: str, notification_type: str,
     ok, failed, blocked = 0, [], []
     for chat_id in chat_ids:
         try:
-            await bot.send_message(chat_id=chat_id, text=message, parse_mode=None,
-                                   disable_web_page_preview=True)
+            await send_with_retry(bot, chat_id, message)
             ok += 1
         except TelegramForbiddenError:
             # Пользователь заблокировал бота — больше ему не пишем

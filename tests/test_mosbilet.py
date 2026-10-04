@@ -183,5 +183,30 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('билетная система не отвечает', sch.heartbeat_text())
 
 
+
+class SendRetryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_then_ok(self):
+        from aiogram.exceptions import TelegramNetworkError
+        from bot import notifications
+        notifications.SEND_RETRY_DELAYS = (0, 0, 0)
+
+        class FlakyBot:
+            calls = 0
+
+            async def send_message(self, **kw):
+                FlakyBot.calls += 1
+                if FlakyBot.calls < 3:
+                    raise TelegramNetworkError(method=None, message='Request timeout error')
+
+        await notifications.send_with_retry(FlakyBot(), 1, 'x')
+        self.assertEqual(FlakyBot.calls, 3)
+
+        class DeadBot:
+            async def send_message(self, **kw):
+                raise TelegramNetworkError(method=None, message='Request timeout error')
+        with self.assertRaises(TelegramNetworkError):
+            await notifications.send_with_retry(DeadBot(), 1, 'x')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -158,8 +158,8 @@ class BaseMonitor(ABC):
     async def alert_admin(self, text: str):
         if not self.bot or not settings.ADMIN_CHAT_ID:
             return
+        from bot.notifications import send_with_retry
         try:
-            await self.bot.send_message(settings.ADMIN_CHAT_ID, text, parse_mode=None,
-                                        disable_web_page_preview=True)
+            await send_with_retry(self.bot, settings.ADMIN_CHAT_ID, text)
         except Exception as e:
             logger.error(f"✗ не удалось написать администратору: {e}")
