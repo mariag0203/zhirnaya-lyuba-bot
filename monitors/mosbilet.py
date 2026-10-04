@@ -135,10 +135,13 @@ class MosbiletMonitor(BaseMonitor):
         try:
             seats = await self.fetch_seats(int(event['ebs_id']), str(event['ebs_agent_uid']))
             self.health.seats_source_ok = True
+            self.health.consecutive_seats_failures = 0
         except (RequestError, ParseError) as e:
             # Без билетной системы новые показы всё равно видны; места — нет.
             logger.warning(f"{self.source_name}: места по показам не получены: {e}")
             self.health.seats_source_ok = False
+            self.health.consecutive_seats_failures += 1
+            self.health.day_seats_failures += 1
             self.health.last_error = f"места по показам не получены: {e}"
             seats = None
 

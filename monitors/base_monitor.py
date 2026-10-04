@@ -44,10 +44,12 @@ class Health:
     shows_found: int = 0
     free_seats_total: int = 0
     seats_source_ok: Optional[bool] = None   # ответила ли билетная система (места по показам)
+    consecutive_seats_failures: int = 0      # проверок подряд без ответа билетной системы
     notes: List[str] = field(default_factory=list)
     # счётчики за сутки для ежедневного «я работаю»
     day_checks: int = 0
     day_failures: int = 0
+    day_seats_failures: int = 0
     day_notifications: int = 0
 
 

@@ -176,6 +176,11 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
         sch = MonitorScheduler()
         sch.monitor = self.mon
         self.assertIn('Я работаю', sch.heartbeat_text())
+        # один сбой билетной системы — не проблема; пять подряд — проблема
+        self.mon.health.consecutive_seats_failures = 1
+        self.assertNotIn('Сейчас есть проблема', sch.heartbeat_text())
+        self.mon.health.consecutive_seats_failures = 5
+        self.assertIn('билетная система не отвечает', sch.heartbeat_text())
 
 
 if __name__ == '__main__':

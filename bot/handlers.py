@@ -90,7 +90,9 @@ async def cmd_status(message: Message):
         lines.append(f"⚠️ Проверок подряд без найденных показов: {h.consecutive_empty} "
                      f"— возможно, сайт поменялся")
     if h and h.seats_source_ok is False:
-        lines.append("⚠️ Билетная система не отдала места по показам — новые показы вижу, места нет")
+        lines.append(f"⚠️ Билетная система не ответила {h.consecutive_seats_failures} "
+                     f"{'проверку' if h.consecutive_seats_failures == 1 else 'проверок'} подряд — "
+                     "новые показы вижу, места по показам сейчас нет")
 
     lines.append("")
     if shows:
